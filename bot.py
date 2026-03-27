@@ -277,13 +277,20 @@ async def process_service(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+def get_files_done_keyboard(count: int):
+    """Кнопка «Далее» после прикрепления файлов."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Далее ➡️ ({count} файл.)", callback_data="files_done")]
+    ])
+
+
 # ─── Шаг 4: Файлы ────────────────────────────────────────────
 @router.message(AppState.waiting_files, F.photo)
 async def process_file_photo(message: Message, state: FSMContext):
     data = await state.get_data()
     files = data.get("files", [])
     if len(files) >= MAX_FILES:
-        await message.answer(f"⚠️ Максимум {MAX_FILES} файлов. Напишите «Конец отправки».")
+        await message.answer(f"⚠️ Максимум {MAX_FILES} файлов.", reply_markup=get_files_done_keyboard(len(files)))
         return
     photo = message.photo[-1]
     files.append({
@@ -292,6 +299,10 @@ async def process_file_photo(message: Message, state: FSMContext):
         "file_name": f"фото_{len(files) + 1}.jpg",
     })
     await state.update_data(files=files)
+    await message.answer(
+        f"✅ Файл {len(files)} принят. Отправьте ещё или нажмите кнопку.",
+        reply_markup=get_files_done_keyboard(len(files))
+    )
 
 
 @router.message(AppState.waiting_files, F.document)
@@ -299,7 +310,7 @@ async def process_file_document(message: Message, state: FSMContext):
     data = await state.get_data()
     files = data.get("files", [])
     if len(files) >= MAX_FILES:
-        await message.answer(f"⚠️ Максимум {MAX_FILES} файлов. Напишите «Конец отправки».")
+        await message.answer(f"⚠️ Максимум {MAX_FILES} файлов.", reply_markup=get_files_done_keyboard(len(files)))
         return
     doc = message.document
     files.append({
@@ -308,6 +319,25 @@ async def process_file_document(message: Message, state: FSMContext):
         "file_name": doc.file_name or f"файл_{len(files) + 1}",
     })
     await state.update_data(files=files)
+    await message.answer(
+        f"✅ Файл {len(files)} принят. Отправьте ещё или нажмите кнопку.",
+        reply_markup=get_files_done_keyboard(len(files))
+    )
+
+
+@router.callback_query(AppState.waiting_files, F.data == "files_done")
+async def process_files_done_button(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    files = data.get("files", [])
+    if not files:
+        await callback.answer("⚠️ Сначала прикрепите хотя бы один файл.")
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        "Комментарий (например: кромка другого цвета или что материал оплачен)"
+    )
+    await state.set_state(AppState.waiting_comment)
+    await callback.answer()
 
 
 @router.message(AppState.waiting_files)
@@ -325,7 +355,7 @@ async def process_files_text(message: Message, state: FSMContext):
         )
         await state.set_state(AppState.waiting_comment)
     else:
-        await message.answer("Прикрепите файлы или напишите «Конец отправки».")
+        await message.answer("Прикрепите файлы или напишите «Далее».")
 
 
 # ─── Шаг 5: Комментарий ──────────────────────────────────────
@@ -359,11 +389,6 @@ async def process_deadline(message: Message, state: FSMContext):
 
     status = await message.answer("⏳ Загружаю файлы и отправляю заявку...")
 
-    if not MANAGER_TELEGRAM_ID:
-        await status.edit_text("⚠️ Ошибка: В настройках не указан MANAGER_TELEGRAM_ID.")
-        await state.clear()
-        return
-
     # 1. Загружаем файлы на Google Drive
     drive_link = ""
     if files and drive_service:
@@ -374,41 +399,39 @@ async def process_deadline(message: Message, state: FSMContext):
         else:
             logger.warning("Не удалось загрузить файлы на Drive")
 
-    # 2. Отправляем в Telegram менеджеру
-    try:
-        text = (
-            f"📋 <b>Новая заявка на раскрой</b>\n\n"
-            f"🏢 <b>Компания:</b> {company}\n"
-            f"👤 <b>Заказ:</b> {order_name}\n"
-            f"📱 <b>Телефон:</b> {phone}\n"
-            f"🛠 <b>Услуга:</b> {service}\n"
-            f"💬 <b>Комментарий:</b> {comment}\n"
-            f"📅 <b>Дата готовности:</b> {deadline}\n"
-            f"🔗 <b>Telegram:</b> {tg_user}\n"
-            f"⏱ <b>Время:</b> {dt_now}"
-        )
-        if drive_link:
-            text += f"\n📁 <b>Файлы на Диске:</b> {drive_link}"
+    # 2. Отправляем в Telegram менеджеру (если указан ID)
+    if MANAGER_TELEGRAM_ID:
+        try:
+            text = (
+                f"📋 <b>Новая заявка на раскрой</b>\n\n"
+                f"🏢 <b>Компания:</b> {company}\n"
+                f"👤 <b>Заказ:</b> {order_name}\n"
+                f"📱 <b>Телефон:</b> {phone}\n"
+                f"🛠 <b>Услуга:</b> {service}\n"
+                f"💬 <b>Комментарий:</b> {comment}\n"
+                f"📅 <b>Дата готовности:</b> {deadline}\n"
+                f"🔗 <b>Telegram:</b> {tg_user}\n"
+                f"⏱ <b>Время:</b> {dt_now}"
+            )
+            if drive_link:
+                text += f"\n📁 <b>Файлы на Диске:</b> {drive_link}"
 
-        await bot.send_message(MANAGER_TELEGRAM_ID, text, parse_mode="HTML")
+            await bot.send_message(MANAGER_TELEGRAM_ID, text, parse_mode="HTML")
 
-        # Пересылаем файлы напрямую тоже
-        if files:
-            media_group = []
-            for f in files:
-                file_id = f["file_id"]
-                if f["type"] == "photo":
-                    media_group.append(InputMediaPhoto(media=file_id))
-                else:
-                    media_group.append(InputMediaDocument(media=file_id))
-            if media_group:
-                await bot.send_media_group(MANAGER_TELEGRAM_ID, media=media_group)
+            # Пересылаем файлы напрямую тоже
+            if files:
+                media_group = []
+                for f in files:
+                    file_id = f["file_id"]
+                    if f["type"] == "photo":
+                        media_group.append(InputMediaPhoto(media=file_id))
+                    else:
+                        media_group.append(InputMediaDocument(media=file_id))
+                if media_group:
+                    await bot.send_media_group(MANAGER_TELEGRAM_ID, media=media_group)
 
-    except Exception as e:
-        logger.error(f"Ошибка отправки в Telegram: {e}")
-        await status.edit_text("⚠️ Ошибка пересылки в Telegram.")
-        await state.clear()
-        return
+        except Exception as e:
+            logger.error(f"Ошибка отправки в Telegram: {e}")
 
     # 3. Пишем в Google Таблицу
     if worksheet:
@@ -429,7 +452,7 @@ async def process_deadline(message: Message, state: FSMContext):
             logger.error(f"Google Sheets append error: {e}")
             await status.edit_text("Заявка отправлена ✅, но не записалась в Таблицу.")
     else:
-        await status.edit_text("Заявка отправлена в Telegram ✅ (Таблица не подключена)")
+        await status.edit_text("⚠️ Таблица не подключена. Заявка не записана.")
 
     await state.clear()
 
