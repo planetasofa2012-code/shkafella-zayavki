@@ -1,0 +1,5 @@
+aiogram==3.4.1
+python-dotenv==1.0.1
+gspread
+google-auth
+google-api-python-client
