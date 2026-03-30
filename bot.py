@@ -13,7 +13,6 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto, InputMediaDocument
 )
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -27,7 +26,7 @@ from googleapiclient.http import MediaFileUpload
 
 from config import BOT_TOKEN, SERVICES, MAX_FILES
 
-MANAGER_TELEGRAM_ID = os.getenv("MANAGER_TELEGRAM_ID", "")
+
 
 # ─── Логирование ──────────────────────────────────────────────
 logging.basicConfig(
@@ -399,41 +398,7 @@ async def process_deadline(message: Message, state: FSMContext):
         else:
             logger.warning("Не удалось загрузить файлы на Drive")
 
-    # 2. Отправляем в Telegram менеджеру (если указан ID)
-    if MANAGER_TELEGRAM_ID:
-        try:
-            text = (
-                f"📋 <b>Новая заявка на раскрой</b>\n\n"
-                f"🏢 <b>Компания:</b> {company}\n"
-                f"👤 <b>Заказ:</b> {order_name}\n"
-                f"📱 <b>Телефон:</b> {phone}\n"
-                f"🛠 <b>Услуга:</b> {service}\n"
-                f"💬 <b>Комментарий:</b> {comment}\n"
-                f"📅 <b>Дата готовности:</b> {deadline}\n"
-                f"🔗 <b>Telegram:</b> {tg_user}\n"
-                f"⏱ <b>Время:</b> {dt_now}"
-            )
-            if drive_link:
-                text += f"\n📁 <b>Файлы на Диске:</b> {drive_link}"
-
-            await bot.send_message(MANAGER_TELEGRAM_ID, text, parse_mode="HTML")
-
-            # Пересылаем файлы напрямую тоже
-            if files:
-                media_group = []
-                for f in files:
-                    file_id = f["file_id"]
-                    if f["type"] == "photo":
-                        media_group.append(InputMediaPhoto(media=file_id))
-                    else:
-                        media_group.append(InputMediaDocument(media=file_id))
-                if media_group:
-                    await bot.send_media_group(MANAGER_TELEGRAM_ID, media=media_group)
-
-        except Exception as e:
-            logger.error(f"Ошибка отправки в Telegram: {e}")
-
-    # 3. Пишем в Google Таблицу
+    # 2. Пишем в Google Таблицу
     if worksheet:
         try:
             row = [
