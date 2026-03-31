@@ -9,6 +9,7 @@ load_dotenv()
 
 # ─── Telegram ─────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+MANAGER_TELEGRAM_ID = os.getenv("MANAGER_TELEGRAM_ID", "")
 
 # ─── Email (SMTP) ────────────────────────────────────────────
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.yandex.ru")

@@ -20,7 +20,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import gspread
-from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
@@ -41,15 +43,31 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 SHEET_ID = "1ovh6v9mNXUTBtJlyNbf3e6a1XoP_9jd4Qxe48KFlZCg"
-ROOT_FOLDER_NAME = "Заявки_Шкафелла_Бот"
+
+# ID расшаренной папки на Google Диске (владелец — Егор или тестовый аккаунт)
+# Сервис-аккаунт должен иметь роль «Редактор» в этой папке
+SHARED_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 
 worksheet = None
 drive_service = None
-root_folder_id = None
 
 try:
-    if os.path.exists("credentials.json"):
-        credentials = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+    credentials = None
+    if os.path.exists("token.json"):
+        credentials = Credentials.from_authorized_user_file("token.json", SCOPES)
+        
+    if not credentials or not credentials.valid:
+        if credentials and credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request())
+        elif os.path.exists("client_secret.json"):
+            flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
+            credentials = flow.run_local_server(port=0)
+            with open("token.json", "w") as token:
+                token.write(credentials.to_json())
+        else:
+            logger.warning("Нет файла client_secret.json или token.json")
+
+    if credentials:
         # Google Sheets
         gc = gspread.authorize(credentials)
         sh = gc.open_by_key(SHEET_ID)
@@ -58,91 +76,37 @@ try:
 
         # Google Drive
         drive_service = build("drive", "v3", credentials=credentials)
-        logger.info("Google Drive подключён!")
-    else:
-        logger.warning("Файл credentials.json не найден.")
+        if SHARED_FOLDER_ID:
+            logger.info(f"Google Drive подключён! Папка: {SHARED_FOLDER_ID}")
+        else:
+            logger.warning("GOOGLE_DRIVE_FOLDER_ID не задан в .env — загрузка файлов отключена")
 except Exception as e:
     logger.error(f"Ошибка подключения к Google API: {e}")
 
 
-def get_or_create_root_folder():
-    """Находит или создаёт корневую папку для всех заявок на Диске сервис-аккаунта."""
-    global root_folder_id
-    if root_folder_id:
-        return root_folder_id
-    if not drive_service:
-        return None
-
-    try:
-        # Ищем существующую папку
-        query = (
-            f"name='{ROOT_FOLDER_NAME}' and "
-            "mimeType='application/vnd.google-apps.folder' and "
-            "trashed=false"
-        )
-        results = drive_service.files().list(q=query, fields="files(id)").execute()
-        files = results.get("files", [])
-
-        if files:
-            root_folder_id = files[0]["id"]
-            logger.info(f"Корневая папка найдена: {root_folder_id}")
-        else:
-            # Создаём новую
-            folder_meta = {
-                "name": ROOT_FOLDER_NAME,
-                "mimeType": "application/vnd.google-apps.folder",
-            }
-            folder = drive_service.files().create(body=folder_meta, fields="id").execute()
-            root_folder_id = folder["id"]
-
-            # Делаем доступной по ссылке (чтобы Егор мог открыть)
-            drive_service.permissions().create(
-                fileId=root_folder_id,
-                body={"type": "anyone", "role": "reader"},
-            ).execute()
-            logger.info(f"Корневая папка создана: {root_folder_id}")
-
-        return root_folder_id
-    except Exception as e:
-        logger.error(f"Ошибка работы с корневой папкой: {e}")
-        return None
-
-
-async def upload_files_to_drive(bot_instance, files_data: list, folder_name: str) -> str:
+async def upload_files_to_drive(bot_instance, files_data: list, folder_name: str) -> tuple[str, list]:
     """
-    Загружает файлы заявки на Google Drive.
+    Загружает файлы заявки на Google Drive в расшаренную папку.
     Создаёт подпапку для каждой заявки.
-    Возвращает ссылку на папку.
+    Возвращает (id_папки, список_файлов: [{"id": ..., "name": ..., "type": ...}, ...])
     """
-    if not drive_service:
-        return ""
-
-    parent_id = get_or_create_root_folder()
-    if not parent_id:
-        return ""
+    if not drive_service or not SHARED_FOLDER_ID:
+        logger.warning("Drive не настроен — файлы не загружены")
+        return "", []
 
     try:
-        # Создаём подпапку для этой заявки
+        # Создаём подпапку для этой заявки внутри расшаренной папки
         subfolder_meta = {
             "name": folder_name,
             "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
+            "parents": [SHARED_FOLDER_ID],
         }
         subfolder = drive_service.files().create(
-            body=subfolder_meta, fields="id,webViewLink"
+            body=subfolder_meta, fields="id"
         ).execute()
         subfolder_id = subfolder["id"]
 
-        # Делаем папку доступной по ссылке
-        drive_service.permissions().create(
-            fileId=subfolder_id,
-            body={"type": "anyone", "role": "reader"},
-        ).execute()
-
-        folder_link = subfolder.get(
-            "webViewLink",
-            f"https://drive.google.com/drive/folders/{subfolder_id}"
-        )
+        uploaded_files = []
 
         # Загружаем каждый файл
         for f in files_data:
@@ -152,7 +116,6 @@ async def upload_files_to_drive(bot_instance, files_data: list, folder_name: str
                 file_bytes = file_io.read()
                 filename = f.get("file_name", "file")
 
-                # Сохраняем во временный файл
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}") as tmp:
                     tmp.write(file_bytes)
                     tmp_path = tmp.name
@@ -162,19 +125,30 @@ async def upload_files_to_drive(bot_instance, files_data: list, folder_name: str
                     "parents": [subfolder_id],
                 }
                 media = MediaFileUpload(tmp_path)
-                drive_service.files().create(body=file_meta, media_body=media).execute()
+                uploaded = drive_service.files().create(
+                    body=file_meta, media_body=media, fields="id"
+                ).execute()
 
-                os.unlink(tmp_path)
+                uploaded_files.append({
+                    "id": uploaded["id"],
+                    "name": filename,
+                    "type": f["type"],
+                })
+
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
                 logger.info(f"Файл загружен на Drive: {filename}")
 
             except Exception as e:
                 logger.error(f"Ошибка загрузки файла {f.get('file_name')}: {e}")
 
-        return folder_link
+        return subfolder_id, uploaded_files
 
     except Exception as e:
         logger.error(f"Ошибка загрузки на Drive: {e}")
-        return ""
+        return "", []
 
 
 # ─── Бот ──────────────────────────────────────────────────────
@@ -188,7 +162,6 @@ dp.include_router(router)
 class AppState(StatesGroup):
     waiting_company = State()
     waiting_order_name = State()
-    waiting_phone = State()
     waiting_service = State()
     waiting_files = State()
     waiting_comment = State()
@@ -226,15 +199,14 @@ async def cmd_cancel(message: Message, state: FSMContext):
 @router.message(Command("folder"))
 async def cmd_folder(message: Message):
     """Показать ссылку на корневую папку со всеми заявками."""
-    folder_id = get_or_create_root_folder()
-    if folder_id:
-        link = f"https://drive.google.com/drive/folders/{folder_id}"
+    if SHARED_FOLDER_ID:
+        link = f"https://drive.google.com/drive/folders/{SHARED_FOLDER_ID}"
         await message.answer(
             f"📁 Папка со всеми заявками:\n{link}",
             parse_mode="HTML"
         )
     else:
-        await message.answer("⚠️ Google Drive не подключён.")
+        await message.answer("⚠️ Google Drive не подключён. Задайте GOOGLE_DRIVE_FOLDER_ID в .env")
 
 
 # ─── Шаг 1: Компания ─────────────────────────────────────────
@@ -248,18 +220,10 @@ async def process_company(message: Message, state: FSMContext):
     await state.set_state(AppState.waiting_order_name)
 
 
-# ─── Шаг 2: Заказ / клиент ───────────────────────────────────
+# ─── Шаг 2: Заказ / клиент ───────────────────────────────
 @router.message(AppState.waiting_order_name)
 async def process_order_name(message: Message, state: FSMContext):
     await state.update_data(order_name=message.text.strip())
-    await message.answer("📞 Укажите ваш номер телефона для связи:")
-    await state.set_state(AppState.waiting_phone)
-
-
-# ─── Шаг 2.1: Телефон ────────────────────────────────────────
-@router.message(AppState.waiting_phone)
-async def process_phone(message: Message, state: FSMContext):
-    await state.update_data(phone=message.text.strip())
     await message.answer("Что будем делать?", reply_markup=get_service_keyboard())
     await state.set_state(AppState.waiting_service)
 
@@ -333,7 +297,7 @@ async def process_files_done_button(callback: CallbackQuery, state: FSMContext):
         return
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
-        "Комментарий (например: кромка другого цвета или что материал оплачен)"
+        "Комментарий (например клей PUR)"
     )
     await state.set_state(AppState.waiting_comment)
     await callback.answer()
@@ -350,7 +314,7 @@ async def process_files_text(message: Message, state: FSMContext):
             await message.answer("⚠️ Вы не прикрепили файлов. Отправьте хотя бы один.")
             return
         await message.answer(
-            "Комментарий (например: кромка другого цвета или что материал оплачен)"
+            "Комментарий (например клей PUR)"
         )
         await state.set_state(AppState.waiting_comment)
     else:
@@ -380,7 +344,6 @@ async def process_deadline(message: Message, state: FSMContext):
     )
     company = data.get("company", "—")
     order_name = data.get("order_name", "—")
-    phone = data.get("phone", "—")
     service = data.get("service", "—")
     comment = data.get("comment", "—")
     deadline = data.get("deadline", "—")
@@ -389,30 +352,34 @@ async def process_deadline(message: Message, state: FSMContext):
     status = await message.answer("⏳ Загружаю файлы и отправляю заявку...")
 
     # 1. Загружаем файлы на Google Drive
-    drive_link = ""
+    folder_id = ""
+    uploaded_files = []
     if files and drive_service:
         folder_name = f"{company}_{order_name}_{dt_now.replace(':', '-')}"
-        drive_link = await upload_files_to_drive(bot, files, folder_name)
-        if drive_link:
-            logger.info(f"Файлы загружены на Drive: {drive_link}")
+        folder_id, uploaded_files = await upload_files_to_drive(bot, files, folder_name)
+        if uploaded_files:
+            logger.info(f"Загружено файлов на Drive: {len(uploaded_files)}")
         else:
             logger.warning("Не удалось загрузить файлы на Drive")
 
     # 2. Пишем в Google Таблицу
     if worksheet:
         try:
+            folder_link = f"https://drive.google.com/drive/folders/{folder_id}" if folder_id else "Нет файлов"
+
             row = [
-                tg_user,                                 # 1. Telegram
-                dt_now,                                  # 2. Время
-                f"{company} / {order_name}",             # 3. Фамилия
-                phone,                                   # 4. Телефон
-                service,                                 # 5. Услуга
-                drive_link or "Файлы в Telegram",        # 6. Ссылка на диск
-                comment,                                 # 7. Комментарий
-                deadline                                 # 8. Дата
+                tg_user,           # A. Telegram
+                dt_now,            # B. Время
+                company,           # C. Название/Фамилия
+                order_name,        # D. Заказ/Телефон
+                service,           # E. Услуга
+                folder_link,       # F. Ссылка на саму папку с файлами
+                comment,           # G. Комментарий
+                deadline,          # H. Дата готовности
             ]
-            worksheet.append_row(row)
-            await status.edit_text("Ваша заявка успешно отправлена ✅")
+
+            worksheet.append_row(row, value_input_option="USER_ENTERED")
+            await status.edit_text("Ваша заявка отправлена ✅")
         except Exception as e:
             logger.error(f"Google Sheets append error: {e}")
             await status.edit_text("Заявка отправлена ✅, но не записалась в Таблицу.")
@@ -425,10 +392,10 @@ async def process_deadline(message: Message, state: FSMContext):
 # ─── Запуск ───────────────────────────────────────────────────
 async def main():
     logger.info("Бот заявок запущен")
-    # При старте создаём/находим корневую папку
-    folder_id = get_or_create_root_folder()
-    if folder_id:
-        logger.info(f"Корневая папка Drive: https://drive.google.com/drive/folders/{folder_id}")
+    if SHARED_FOLDER_ID:
+        logger.info(f"Папка Drive: https://drive.google.com/drive/folders/{SHARED_FOLDER_ID}")
+    else:
+        logger.warning("GOOGLE_DRIVE_FOLDER_ID не задан — файлы не будут загружаться")
     await dp.start_polling(bot)
 
 

@@ -7,4 +7,4 @@ services:
     env_file:
       - .env
     volumes:
-      - ./credentials.json:/app/credentials.json:ro
+      - ./token.json:/app/token.json
