@@ -106,15 +106,6 @@ async def upload_files_to_drive(bot_instance, files_data: list, folder_name: str
         ).execute()
         subfolder_id = subfolder["id"]
 
-        # Раздаём права «Доступно всем, у кого есть ссылка» (Читатель)
-        try:
-            drive_service.permissions().create(
-                fileId=subfolder_id,
-                body={"type": "anyone", "role": "reader"}
-            ).execute()
-        except Exception as e:
-            logger.warning(f"Ошибка выдачи прав на подпапку: {e}")
-
         uploaded_files = []
 
         # Загружаем каждый файл
